@@ -26,6 +26,15 @@ var (
 		return fmt.Sprintf("bid-data-%x-%s", bidId, key)
 	}
 
+	formatRedisBidIndexKey = func(blockNumber uint64, namespace string) string {
+		return fmt.Sprintf("bid-index-protocol-%s-bn-%d", namespace, blockNumber)
+	}
+
+	// Index written by earlier versions as a JSON list stored on the mempool bid.
+	formatRedisLegacyBidIndexKey = func(blockNumber uint64, namespace string) string {
+		return fmt.Sprintf("protocol-%s-bn-%d", namespace, blockNumber)
+	}
+
 	ffStoreTTL = 24 * time.Hour
 )
 
@@ -99,19 +108,17 @@ func (r *RedisStoreBackend) Stop() error {
 func (r *RedisStoreBackend) InitializeBid(bid suave.Bid) error {
 	key := formatRedisBidKey(bid.Id)
 
-	err := r.client.Get(r.ctx, key).Err()
-	if !errors.Is(err, redis.Nil) {
-		return suave.ErrBidAlreadyPresent
-	}
-
 	data, err := json.Marshal(bid)
 	if err != nil {
 		return err
 	}
 
-	err = r.client.Set(r.ctx, key, string(data), ffStoreTTL).Err()
+	created, err := r.client.SetNX(r.ctx, key, string(data), ffStoreTTL).Result()
 	if err != nil {
 		return err
+	}
+	if !created {
+		return suave.ErrBidAlreadyPresent
 	}
 
 	err = r.indexBid(bid)
@@ -168,29 +175,57 @@ var (
 func (r *RedisStoreBackend) indexBid(bid suave.Bid) error {
 	defer log.Info("bid submitted", "bid", bid, "store", r.Store)
 
-	var bidsByBlockAndProtocol []suave.BidId
-	bidsByBlockAndProtocolBytes, err := r.Retrieve(mempoolConfidentialStoreBid, mempoolConfStoreAddr, fmt.Sprintf("protocol-%s-bn-%d", bid.Version, bid.DecryptionCondition))
-	if err == nil {
-		bidsByBlockAndProtocol = suave.MustDecode[[]suave.BidId](bidsByBlockAndProtocolBytes)
+	// The index is appended to server-side so that concurrent writers, including
+	// other kettles sharing this Redis, cannot overwrite each other's entries.
+	key := formatRedisBidIndexKey(bid.DecryptionCondition, bid.Version)
+	_, err := r.client.TxPipelined(r.ctx, func(pipe redis.Pipeliner) error {
+		pipe.RPush(r.ctx, key, bid.Id[:])
+		pipe.Expire(r.ctx, key, ffStoreTTL)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("could not index bid %x: %w", bid.Id, err)
 	}
-	// store bid by block number and by protocol + block number
-	bidsByBlockAndProtocol = append(bidsByBlockAndProtocol, bid.Id)
-
-	r.Store(mempoolConfidentialStoreBid, mempoolConfStoreAddr, fmt.Sprintf("protocol-%s-bn-%d", bid.Version, bid.DecryptionCondition), suave.MustEncode(bidsByBlockAndProtocol))
 
 	return nil
 }
 
 func (r *RedisStoreBackend) FetchBidsByProtocolAndBlock(blockNumber uint64, namespace string) []suave.Bid {
-	bidsByProtocolBytes, err := r.Retrieve(mempoolConfidentialStoreBid, mempoolConfStoreAddr, fmt.Sprintf("protocol-%s-bn-%d", namespace, blockNumber))
-	if err != nil {
+	var bidIDs []suave.BidId
+
+	legacyIndexBytes, err := r.Retrieve(mempoolConfidentialStoreBid, mempoolConfStoreAddr, formatRedisLegacyBidIndexKey(blockNumber, namespace))
+	if err == nil {
+		var legacyIDs []suave.BidId
+		if err := json.Unmarshal(legacyIndexBytes, &legacyIDs); err == nil {
+			bidIDs = append(bidIDs, legacyIDs...)
+		}
+	}
+
+	rawIDs, err := r.client.LRange(r.ctx, formatRedisBidIndexKey(blockNumber, namespace), 0, -1).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		log.Error("could not fetch bid index", "blockNumber", blockNumber, "namespace", namespace, "err", err)
+	}
+	for _, rawID := range rawIDs {
+		var id suave.BidId
+		if len(rawID) != len(id) {
+			continue
+		}
+		copy(id[:], rawID)
+		bidIDs = append(bidIDs, id)
+	}
+
+	if len(bidIDs) == 0 {
 		return nil
 	}
 
 	res := []suave.Bid{}
-
-	bidIDs := suave.MustDecode[[]suave.BidId](bidsByProtocolBytes)
+	seen := make(map[suave.BidId]struct{}, len(bidIDs))
 	for _, id := range bidIDs {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
 		bid, err := r.FetchBidById(id)
 		if err != nil {
 			continue
