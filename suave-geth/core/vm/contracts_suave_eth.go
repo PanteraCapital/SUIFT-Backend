@@ -310,6 +310,9 @@ func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.Buil
 			}
 
 			matchBidIds := unpackedBidIds[0].([][16]byte)
+			if len(matchBidIds) != 2 {
+				return nil, nil, fmt.Errorf("expected 2 matched bid ids for bid %v, got %d", bid.Id, len(matchBidIds))
+			}
 
 			userBundleBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(matchBidIds[0], buildEthBlockAddress, "mevshare:v0:ethBundles")
 			if err != nil {
@@ -631,6 +634,9 @@ func (c *fillMevShareBundle) runImpl(suaveContext *SuaveContext, bidId types.Bid
 	}
 
 	matchBidIds := unpackedBidIds[0].([][16]byte)
+	if len(matchBidIds) != 2 {
+		return nil, fmt.Errorf("expected 2 matched bid ids for bid %v, got %d", bid.Id, len(matchBidIds))
+	}
 
 	userBundleBytes, err := (&confRetrieve{}).runImpl(suaveContext, matchBidIds[0], "mevshare:v0:ethBundles")
 	if err != nil {
