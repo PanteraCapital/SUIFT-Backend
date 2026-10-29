@@ -27,6 +27,9 @@ var (
 	}
 
 	ffStoreTTL = 24 * time.Hour
+
+	errRedisDataNotFound   = errors.New("confidential store: data not found")
+	errRedisRetrieveFailed = errors.New("confidential store: retrieve failed")
 )
 
 type RedisStoreBackend struct {
@@ -152,8 +155,13 @@ func (r *RedisStoreBackend) Store(bid suave.Bid, caller common.Address, key stri
 func (r *RedisStoreBackend) Retrieve(bid suave.Bid, caller common.Address, key string) ([]byte, error) {
 	storeKey := formatRedisBidValueKey(bid.Id, key)
 	data, err := r.client.Get(r.ctx, storeKey).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return []byte{}, errRedisDataNotFound
+	}
 	if err != nil {
-		return []byte{}, fmt.Errorf("unexpected redis error: %w, %s, %v", err, storeKey, r.client.Keys(context.TODO(), "*").String())
+		// Retrieve errors are returned to contracts and RPC clients, so details stay in the node log.
+		log.Warn("redis store: retrieve failed", "err", err)
+		return []byte{}, errRedisRetrieveFailed
 	}
 
 	return data, nil
