@@ -220,33 +220,36 @@ func (e *ConfidentialStoreEngine) Retrieve(bidId suave.BidId, caller common.Addr
 	return e.storage.Retrieve(bid, caller, key)
 }
 
+// Finalize commits the bids and writes produced while executing tx. Every check
+// and the message signature happen before the first write reaches the backend,
+// so a refused finalize leaves the store untouched.
 func (e *ConfidentialStoreEngine) Finalize(tx *types.Transaction, newBids map[suave.BidId]suave.Bid, stores []StoreWrite) error {
-	//
-	for _, bid := range newBids {
-		err := e.storage.InitializeBid(bid)
-		if err != nil {
-			// TODO: deinitialize!
-			return fmt.Errorf("confidential engine: store backend failed to initialize bid: %w", err)
-		}
+	if tx == nil {
+		return suave.ErrUnsignedFinalize
 	}
 
+	if _, sigErr := e.chainSigner.Sender(tx); sigErr != nil {
+		log.Info("confidential engine: refusing to commit writes based on unsigned transaction", "hash", tx.Hash().Hex(), "err", sigErr)
+		return suave.ErrUnsignedFinalize
+	}
+
+	// Only records created by the authorized source transaction may be committed with it.
+	sourceHash := tx.Hash()
+	for id, bid := range newBids {
+		if bid.Id != id || bid.CreationTx == nil || bid.CreationTx.Hash() != sourceHash {
+			return fmt.Errorf("confidential engine: bid %x was not created by source transaction %s", bid.Id, sourceHash.Hex())
+		}
+	}
 	for _, sw := range stores {
-		if _, err := e.storage.Store(sw.Bid, sw.Caller, sw.Key, sw.Value); err != nil {
-			// TODO: deinitialize and deStore!
-			return fmt.Errorf("failed to store data: %w", err)
+		if _, pending := newBids[sw.Bid.Id]; pending && (sw.Bid.CreationTx == nil || sw.Bid.CreationTx.Hash() != sourceHash) {
+			return fmt.Errorf("confidential engine: write to bid %x was not created by source transaction %s", sw.Bid.Id, sourceHash.Hex())
 		}
 	}
 
-	// Sign and propagate the message
 	pwMsg := DAMessage{
 		SourceTx:    tx,
 		StoreWrites: stores,
 		StoreUUID:   e.storeUUID,
-	}
-
-	if _, sigErr := e.chainSigner.Sender(tx); sigErr != nil {
-		log.Info("confidential engine: refusing to send writes based on unsigned transaction", "hash", tx.Hash().Hex(), "err", sigErr)
-		return suave.ErrUnsignedFinalize
 	}
 
 	msgBytes, err := SerializeMessageForSigning(&pwMsg)
@@ -262,6 +265,21 @@ func (e *ConfidentialStoreEngine) Finalize(tx *types.Transaction, newBids map[su
 	pwMsg.Signature, err = e.daSigner.Sign(signingAccount, msgBytes)
 	if err != nil {
 		return fmt.Errorf("confidential engine: could not sign message: %w", err)
+	}
+
+	for _, bid := range newBids {
+		err := e.storage.InitializeBid(bid)
+		if err != nil {
+			// TODO: deinitialize!
+			return fmt.Errorf("confidential engine: store backend failed to initialize bid: %w", err)
+		}
+	}
+
+	for _, sw := range stores {
+		if _, err := e.storage.Store(sw.Bid, sw.Caller, sw.Key, sw.Value); err != nil {
+			// TODO: deinitialize and deStore!
+			return fmt.Errorf("failed to store data: %w", err)
+		}
 	}
 
 	// TODO: avoid marshalling twice
