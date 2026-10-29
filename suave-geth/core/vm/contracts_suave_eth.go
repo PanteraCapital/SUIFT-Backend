@@ -265,7 +265,7 @@ func (c *buildEthBlock) RunConfidential(suaveContext *SuaveContext, input []byte
 }
 
 func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.BuildBlockArgs, bidId types.BidId, namespace string) ([]byte, []byte, error) {
-	bidIds := [][16]byte{}
+	var mergedBundles []types.SBundle
 	// first check for merged bid, else assume regular bid
 	if mergedBidsBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(bidId, buildEthBlockAddress, "default:v0:mergedBids"); err == nil {
 		unpacked, err := bidIdsAbi.Inputs.Unpack(mergedBidsBytes)
@@ -273,93 +273,24 @@ func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.Buil
 		if err != nil {
 			return nil, nil, fmt.Errorf("could not unpack merged bid ids: %w", err)
 		}
-		bidIds = unpacked[0].([][16]byte)
-	} else {
-		bidIds = append(bidIds, bidId)
-	}
 
-	var bidsToMerge = make([]types.Bid, len(bidIds))
-	for i, bidId := range bidIds {
-		var err error
-
-		bid, err := suaveContext.Backend.ConfidentialStore.FetchBidById(bidId)
-		if err != nil {
-			return nil, nil, fmt.Errorf("could not fetch bid id %v: %w", bidId, err)
+		// Merged bids are taken from a pool anyone can submit to, so a single bid
+		// that cannot be accessed or decoded must not prevent the rest of the
+		// block from being built.
+		for _, mergedBidId := range unpacked[0].([][16]byte) {
+			bundles, err := c.loadBundles(suaveContext, mergedBidId)
+			if err != nil {
+				log.Warn("skipping bid that cannot be included in the block", "bidId", mergedBidId, "err", err)
+				continue
+			}
+			mergedBundles = append(mergedBundles, bundles...)
 		}
-
-		if _, err := checkIsPrecompileCallAllowed(suaveContext, buildEthBlockAddress, bid); err != nil {
+	} else {
+		bundles, err := c.loadBundles(suaveContext, bidId)
+		if err != nil {
 			return nil, nil, err
 		}
-
-		bidsToMerge[i] = bid.ToInnerBid()
-	}
-
-	var mergedBundles []types.SBundle
-	for _, bid := range bidsToMerge {
-		switch bid.Version {
-		case "mevshare:v0:matchBids":
-			// fetch the matched ids and merge the bundle
-			matchedBundleIdsBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(bid.Id, buildEthBlockAddress, "mevshare:v0:mergedBids")
-			if err != nil {
-				return nil, nil, fmt.Errorf("could not retrieve bid ids data for bid %v, from cdas: %w", bid, err)
-			}
-
-			unpackedBidIds, err := bidIdsAbi.Inputs.Unpack(matchedBundleIdsBytes)
-			if err != nil {
-				return nil, nil, fmt.Errorf("could not unpack bid ids data for bid %v, from cdas: %w", bid, err)
-			}
-
-			matchBidIds := unpackedBidIds[0].([][16]byte)
-
-			userBundleBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(matchBidIds[0], buildEthBlockAddress, "mevshare:v0:ethBundles")
-			if err != nil {
-				return nil, nil, fmt.Errorf("could not retrieve bundle data for bidId %v: %w", matchBidIds[0], err)
-			}
-
-			var userBundle types.SBundle
-			if err := json.Unmarshal(userBundleBytes, &userBundle); err != nil {
-				return nil, nil, fmt.Errorf("could not unmarshal user bundle data for bidId %v: %w", matchBidIds[0], err)
-			}
-
-			matchBundleBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(matchBidIds[1], buildEthBlockAddress, "mevshare:v0:ethBundles")
-			if err != nil {
-				return nil, nil, fmt.Errorf("could not retrieve match bundle data for bidId %v: %w", matchBidIds[1], err)
-			}
-
-			var matchBundle types.SBundle
-			if err := json.Unmarshal(matchBundleBytes, &matchBundle); err != nil {
-				return nil, nil, fmt.Errorf("could not unmarshal match bundle data for bidId %v: %w", matchBidIds[1], err)
-			}
-
-			userBundle.Txs = append(userBundle.Txs, matchBundle.Txs...)
-
-			mergedBundles = append(mergedBundles, userBundle)
-
-		case "mevshare:v0:unmatchedBundles":
-			bundleBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(bid.Id, buildEthBlockAddress, "mevshare:v0:ethBundles")
-			if err != nil {
-				return nil, nil, fmt.Errorf("could not retrieve bundle data for bidId %v, from cdas: %w", bid.Id, err)
-			}
-
-			var bundle types.SBundle
-			if err := json.Unmarshal(bundleBytes, &bundle); err != nil {
-				return nil, nil, fmt.Errorf("could not unmarshal bundle data for bidId %v, from cdas: %w", bid.Id, err)
-			}
-			mergedBundles = append(mergedBundles, bundle)
-		case "default:v0:ethBundles":
-			bundleBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(bid.Id, buildEthBlockAddress, "default:v0:ethBundles")
-			if err != nil {
-				return nil, nil, fmt.Errorf("could not retrieve bundle data for bidId %v, from cdas: %w", bid.Id, err)
-			}
-
-			var bundle types.SBundle
-			if err := json.Unmarshal(bundleBytes, &bundle); err != nil {
-				return nil, nil, fmt.Errorf("could not unmarshal bundle data for bidId %v, from cdas: %w", bid.Id, err)
-			}
-			mergedBundles = append(mergedBundles, bundle)
-		default:
-			return nil, nil, fmt.Errorf("unknown bid version %s", bid.Version)
-		}
+		mergedBundles = append(mergedBundles, bundles...)
 	}
 
 	log.Info("requesting a block be built", "mergedBundles", mergedBundles)
@@ -429,6 +360,83 @@ func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.Buil
 	}
 
 	return bidBytes, envelopeBytes, nil
+}
+
+func (c *buildEthBlock) loadBundles(suaveContext *SuaveContext, bidId types.BidId) ([]types.SBundle, error) {
+	bid, err := suaveContext.Backend.ConfidentialStore.FetchBidById(bidId)
+	if err != nil {
+		return nil, fmt.Errorf("could not fetch bid id %v: %w", bidId, err)
+	}
+
+	if _, err := checkIsPrecompileCallAllowed(suaveContext, buildEthBlockAddress, bid); err != nil {
+		return nil, err
+	}
+
+	switch bid.Version {
+	case "mevshare:v0:matchBids":
+		// fetch the matched ids and merge the bundle
+		matchedBundleIdsBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(bid.Id, buildEthBlockAddress, "mevshare:v0:mergedBids")
+		if err != nil {
+			return nil, fmt.Errorf("could not retrieve bid ids data for bid %v, from cdas: %w", bid.Id, err)
+		}
+
+		unpackedBidIds, err := bidIdsAbi.Inputs.Unpack(matchedBundleIdsBytes)
+		if err != nil {
+			return nil, fmt.Errorf("could not unpack bid ids data for bid %v, from cdas: %w", bid.Id, err)
+		}
+
+		matchBidIds := unpackedBidIds[0].([][16]byte)
+		if len(matchBidIds) < 2 {
+			return nil, fmt.Errorf("expected a user and a match bid id for bid %v, got %d ids", bid.Id, len(matchBidIds))
+		}
+
+		userBundle, err := c.retrieveBundle(suaveContext, matchBidIds[0], "mevshare:v0:ethBundles")
+		if err != nil {
+			return nil, fmt.Errorf("could not load user bundle for bidId %v: %w", matchBidIds[0], err)
+		}
+
+		// The match is supplied by a third party, so it must not be able to drop
+		// the user bundle it refers to. The user bundle follows the merged one:
+		// if the merged bundle is included the miner skips the user bundle, as
+		// its transactions are already in the block.
+		matchBundle, err := c.retrieveBundle(suaveContext, matchBidIds[1], "mevshare:v0:ethBundles")
+		if err != nil {
+			log.Warn("including user bundle without its unusable match", "bidId", bid.Id, "err", err)
+			return []types.SBundle{userBundle}, nil
+		}
+
+		mergedBundle := userBundle
+		mergedBundle.Txs = append(append(types.Transactions{}, userBundle.Txs...), matchBundle.Txs...)
+		return []types.SBundle{mergedBundle, userBundle}, nil
+
+	case "mevshare:v0:unmatchedBundles":
+		return c.retrieveBundles(suaveContext, bid.Id, "mevshare:v0:ethBundles")
+	case "default:v0:ethBundles":
+		return c.retrieveBundles(suaveContext, bid.Id, "default:v0:ethBundles")
+	default:
+		return nil, fmt.Errorf("unknown bid version %s", bid.Version)
+	}
+}
+
+func (c *buildEthBlock) retrieveBundles(suaveContext *SuaveContext, bidId types.BidId, key string) ([]types.SBundle, error) {
+	bundle, err := c.retrieveBundle(suaveContext, bidId, key)
+	if err != nil {
+		return nil, err
+	}
+	return []types.SBundle{bundle}, nil
+}
+
+func (c *buildEthBlock) retrieveBundle(suaveContext *SuaveContext, bidId types.BidId, key string) (types.SBundle, error) {
+	bundleBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(bidId, buildEthBlockAddress, key)
+	if err != nil {
+		return types.SBundle{}, fmt.Errorf("could not retrieve bundle data for bidId %v, from cdas: %w", bidId, err)
+	}
+
+	var bundle types.SBundle
+	if err := json.Unmarshal(bundleBytes, &bundle); err != nil {
+		return types.SBundle{}, fmt.Errorf("could not unmarshal bundle data for bidId %v, from cdas: %w", bidId, err)
+	}
+	return bundle, nil
 }
 
 type submitEthBlockBidToRelay struct{}
