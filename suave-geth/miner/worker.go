@@ -18,6 +18,7 @@ package miner
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"math/big"
@@ -1310,53 +1311,16 @@ func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlo
 	profitPre := work.state.GetBalance(params.coinbase)
 
 	for _, bundle := range bundles {
-		// NOTE: failing bundles will cause the block to not be built!
-
-		// apply bundle
-		profitPreBundle := work.state.GetBalance(params.coinbase)
-		if err := w.rawCommitTransactions(work, bundle.Txs); err != nil {
-			return nil, nil, err
+		// A failing bundle is reverted and skipped so that it cannot prevent
+		// the remaining bundles from being included.
+		snapshot := work.copy()
+		if err := w.commitBundle(work, bundle, ephemeralAddr, ephemeralPrivKey, refundTransferCost); err != nil {
+			log.Debug("Skipping bundle that failed to apply", "err", err)
+			work.discard()
+			*work = *snapshot
+			continue
 		}
-		profitPostBundle := work.state.GetBalance(params.coinbase)
-
-		// calc & refund user if bundle has multiple txns and wants refund
-		if len(bundle.Txs) > 1 && bundle.RefundPercent != nil {
-			// Note: PoC logic, this could be gamed by not sending any eth to coinbase
-			refundPrct := *bundle.RefundPercent
-			if refundPrct == 0 {
-				// default refund
-				refundPrct = 10
-			}
-			bundleProfit := new(big.Int).Sub(profitPostBundle, profitPreBundle)
-			refundAmt := new(big.Int).Div(bundleProfit, big.NewInt(int64(refundPrct)))
-			// subtract payment txn transfer costs
-			refundAmt = new(big.Int).Sub(refundAmt, refundTransferCost)
-
-			currNonce := work.state.GetNonce(ephemeralAddr)
-			// HACK to include payment txn
-			// multi refund block untested
-			bidTx := bundle.Txs[0] // NOTE : assumes first txn is refund recipient
-			refundAddr, err := types.Sender(types.LatestSignerForChainID(bidTx.ChainId()), bidTx)
-			if err != nil {
-				return nil, nil, err
-			}
-			paymentTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
-				Nonce:    currNonce,
-				To:       &refundAddr,
-				Value:    refundAmt,
-				Gas:      28000,
-				GasPrice: work.header.BaseFee,
-			}), work.signer, ephemeralPrivKey)
-
-			if err != nil {
-				return nil, nil, err
-			}
-
-			// commit payment txn
-			if err := w.rawCommitTransactions(work, types.Transactions{paymentTx}); err != nil {
-				return nil, nil, err
-			}
-		}
+		snapshot.discard()
 	}
 
 	profitPost := work.state.GetBalance(params.coinbase)
@@ -1387,6 +1351,54 @@ func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlo
 		return nil, nil, err
 	}
 	return block, proposerProfit, nil
+}
+
+func (w *worker) commitBundle(work *environment, bundle types.SBundle, ephemeralAddr common.Address, ephemeralPrivKey *ecdsa.PrivateKey, refundTransferCost *big.Int) error {
+	profitPreBundle := work.state.GetBalance(work.coinbase)
+	if err := w.rawCommitTransactions(work, bundle.Txs); err != nil {
+		return err
+	}
+	profitPostBundle := work.state.GetBalance(work.coinbase)
+
+	// calc & refund user if bundle has multiple txns and wants refund
+	if len(bundle.Txs) > 1 && bundle.RefundPercent != nil {
+		// Note: PoC logic, this could be gamed by not sending any eth to coinbase
+		refundPrct := *bundle.RefundPercent
+		if refundPrct == 0 {
+			// default refund
+			refundPrct = 10
+		}
+		bundleProfit := new(big.Int).Sub(profitPostBundle, profitPreBundle)
+		refundAmt := new(big.Int).Div(bundleProfit, big.NewInt(int64(refundPrct)))
+		// subtract payment txn transfer costs
+		refundAmt = new(big.Int).Sub(refundAmt, refundTransferCost)
+
+		currNonce := work.state.GetNonce(ephemeralAddr)
+		// HACK to include payment txn
+		// multi refund block untested
+		bidTx := bundle.Txs[0] // NOTE : assumes first txn is refund recipient
+		refundAddr, err := types.Sender(types.LatestSignerForChainID(bidTx.ChainId()), bidTx)
+		if err != nil {
+			return err
+		}
+		paymentTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
+			Nonce:    currNonce,
+			To:       &refundAddr,
+			Value:    refundAmt,
+			Gas:      28000,
+			GasPrice: work.header.BaseFee,
+		}), work.signer, ephemeralPrivKey)
+
+		if err != nil {
+			return err
+		}
+
+		// commit payment txn
+		if err := w.rawCommitTransactions(work, types.Transactions{paymentTx}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *worker) rawCommitTransactions(env *environment, txs types.Transactions) error {
