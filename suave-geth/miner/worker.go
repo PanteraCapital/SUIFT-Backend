@@ -18,6 +18,7 @@ package miner
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"math/big"
@@ -1305,80 +1306,39 @@ func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlo
 	defer work.discard()
 
 	// Assume static 28000 gas transfers for both mev-share and proposer payments
-	refundTransferCost := new(big.Int).Mul(big.NewInt(28000), work.header.BaseFee)
+	refundTransferCost := new(big.Int).Mul(big.NewInt(int64(bundlePaymentGas)), work.header.BaseFee)
+
+	// Keep gas aside so bundles cannot crowd out the proposer payment.
+	work.gasPool = new(core.GasPool).AddGas(work.header.GasLimit)
+	if err := work.gasPool.SubGas(bundlePaymentGas); err != nil {
+		return nil, nil, fmt.Errorf("gas limit too low for proposer payment: %w", err)
+	}
 
 	profitPre := work.state.GetBalance(params.coinbase)
 
-	for _, bundle := range bundles {
-		// NOTE: failing bundles will cause the block to not be built!
-
-		// apply bundle
-		profitPreBundle := work.state.GetBalance(params.coinbase)
-		if err := w.rawCommitTransactions(work, bundle.Txs); err != nil {
-			return nil, nil, err
-		}
-		profitPostBundle := work.state.GetBalance(params.coinbase)
-
-		// calc & refund user if bundle has multiple txns and wants refund
-		if len(bundle.Txs) > 1 && bundle.RefundPercent != nil {
-			// Note: PoC logic, this could be gamed by not sending any eth to coinbase
-			refundPrct := *bundle.RefundPercent
-			if refundPrct == 0 {
-				// default refund
-				refundPrct = 10
-			}
-			bundleProfit := new(big.Int).Sub(profitPostBundle, profitPreBundle)
-			refundAmt := new(big.Int).Div(bundleProfit, big.NewInt(int64(refundPrct)))
-			// subtract payment txn transfer costs
-			refundAmt = new(big.Int).Sub(refundAmt, refundTransferCost)
-
-			currNonce := work.state.GetNonce(ephemeralAddr)
-			// HACK to include payment txn
-			// multi refund block untested
-			bidTx := bundle.Txs[0] // NOTE : assumes first txn is refund recipient
-			refundAddr, err := types.Sender(types.LatestSignerForChainID(bidTx.ChainId()), bidTx)
-			if err != nil {
-				return nil, nil, err
-			}
-			paymentTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
-				Nonce:    currNonce,
-				To:       &refundAddr,
-				Value:    refundAmt,
-				Gas:      28000,
-				GasPrice: work.header.BaseFee,
-			}), work.signer, ephemeralPrivKey)
-
-			if err != nil {
-				return nil, nil, err
-			}
-
-			// commit payment txn
-			if err := w.rawCommitTransactions(work, types.Transactions{paymentTx}); err != nil {
-				return nil, nil, err
-			}
+	for i, bundle := range bundles {
+		if err := w.commitRefundBundle(work, bundle, ephemeralPrivKey, refundTransferCost); err != nil {
+			log.Debug("Skipping bundle", "index", i, "err", err)
 		}
 	}
 
-	profitPost := work.state.GetBalance(params.coinbase)
-	proposerProfit := new(big.Int).Set(profitPost) // = post-pre-transfer_cost
-	proposerProfit = proposerProfit.Sub(profitPost, profitPre)
-	proposerProfit = proposerProfit.Sub(proposerProfit, refundTransferCost)
+	work.gasPool.AddGas(bundlePaymentGas)
 
-	currNonce := work.state.GetNonce(ephemeralAddr)
-	paymentTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
-		Nonce:    currNonce,
-		To:       &args.FeeRecipient,
-		Value:    proposerProfit,
-		Gas:      28000,
-		GasPrice: work.header.BaseFee,
-	}), work.signer, ephemeralPrivKey)
+	profitPost := work.state.GetBalance(params.coinbase)
+	proposerProfit := new(big.Int).Sub(profitPost, profitPre)
+	proposerProfit.Sub(proposerProfit, refundTransferCost)
+	if proposerProfit.Sign() <= 0 {
+		return nil, nil, fmt.Errorf("bundles do not cover the proposer payment: profit %v, transfer cost %v", new(big.Int).Sub(profitPost, profitPre), refundTransferCost)
+	}
+
+	paymentTx, err := signCoinbasePayment(work, ephemeralPrivKey, args.FeeRecipient, proposerProfit)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not sign proposer payment: %w", err)
 	}
 
 	// commit payment txn
-	if err := w.rawCommitTransactions(work, types.Transactions{paymentTx}); err != nil {
-		return nil, nil, fmt.Errorf("could not sign proposer payment: %w", err)
+	if err := w.commitBundleTxs(work, types.Transactions{paymentTx}); err != nil {
+		return nil, nil, fmt.Errorf("could not commit proposer payment: %w", err)
 	}
 
 	log.Info("buildBlockFromBundles", "num_bundles", len(bundles), "num_txns", len(work.txs), "profit", proposerProfit)
@@ -1387,6 +1347,135 @@ func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlo
 		return nil, nil, err
 	}
 	return block, proposerProfit, nil
+}
+
+const (
+	bundlePaymentGas = uint64(28000)
+	maxRefundPercent = 100
+)
+
+// commitRefundBundle applies a bundle and its refund atomically. On any failure
+// the environment is restored and the bundle is left out of the block.
+//
+// The refund is RefundPercent percent of the coinbase profit paid by the refund
+// recipient's own transactions, so transactions signed by others (e.g. a merged
+// searcher backrun or a copied public transaction) do not count towards it.
+func (w *worker) commitRefundBundle(env *environment, bundle types.SBundle, coinbaseKey *ecdsa.PrivateKey, transferCost *big.Int) error {
+	if len(bundle.Txs) == 0 {
+		return errors.New("empty bundle")
+	}
+
+	refundPercent := 0
+	if bundle.RefundPercent != nil {
+		if *bundle.RefundPercent < 0 || *bundle.RefundPercent > maxRefundPercent {
+			return fmt.Errorf("refund percent %d outside [0, %d]", *bundle.RefundPercent, maxRefundPercent)
+		}
+		if len(bundle.Txs) > 1 {
+			refundPercent = *bundle.RefundPercent
+		}
+	}
+
+	var refundAddr common.Address
+	if refundPercent > 0 {
+		var err error
+		// the first transaction's sender is the refund recipient
+		if refundAddr, err = types.Sender(env.signer, bundle.Txs[0]); err != nil {
+			return err
+		}
+	}
+
+	snap := env.snapshot()
+
+	refundableProfit := new(big.Int)
+	for _, tx := range bundle.Txs {
+		pre := env.state.GetBalance(env.coinbase)
+		if err := w.commitBundleTxs(env, types.Transactions{tx}); err != nil {
+			env.restore(snap)
+			return err
+		}
+		if refundPercent == 0 {
+			continue
+		}
+		if from, err := types.Sender(env.signer, tx); err == nil && from == refundAddr {
+			refundableProfit.Add(refundableProfit, new(big.Int).Sub(env.state.GetBalance(env.coinbase), pre))
+		}
+	}
+
+	if refundPercent == 0 {
+		return nil
+	}
+
+	refund := new(big.Int).Mul(refundableProfit, big.NewInt(int64(refundPercent)))
+	refund.Div(refund, big.NewInt(100))
+	refund.Sub(refund, transferCost)
+	if refund.Sign() <= 0 {
+		return nil
+	}
+
+	paymentTx, err := signCoinbasePayment(env, coinbaseKey, refundAddr, refund)
+	if err != nil {
+		env.restore(snap)
+		return err
+	}
+	if err := w.commitBundleTxs(env, types.Transactions{paymentTx}); err != nil {
+		env.restore(snap)
+		return fmt.Errorf("could not commit refund payment: %w", err)
+	}
+	return nil
+}
+
+// commitBundleTxs commits txs and fails unless every one of them was included.
+func (w *worker) commitBundleTxs(env *environment, txs types.Transactions) error {
+	tcount := env.tcount
+	if err := w.rawCommitTransactions(env, txs); err != nil {
+		return err
+	}
+	if env.tcount-tcount != len(txs) {
+		return errors.New("not enough gas left to include all transactions")
+	}
+	return nil
+}
+
+func signCoinbasePayment(env *environment, coinbaseKey *ecdsa.PrivateKey, to common.Address, value *big.Int) (*types.Transaction, error) {
+	return types.SignTx(types.NewTx(&types.LegacyTx{
+		Nonce:    env.state.GetNonce(crypto.PubkeyToAddress(coinbaseKey.PublicKey)),
+		To:       &to,
+		Value:    value,
+		Gas:      bundlePaymentGas,
+		GasPrice: env.header.BaseFee,
+	}), env.signer, coinbaseKey)
+}
+
+type envSnapshot struct {
+	state    *state.StateDB
+	gas      uint64
+	gasUsed  uint64
+	tcount   int
+	txs      int
+	receipts int
+}
+
+// snapshot copies the state, since the per-transaction Finalise clears the
+// journal and a StateDB snapshot cannot be reverted across transactions.
+func (env *environment) snapshot() envSnapshot {
+	return envSnapshot{
+		state:    env.state.Copy(),
+		gas:      env.gasPool.Gas(),
+		gasUsed:  env.header.GasUsed,
+		tcount:   env.tcount,
+		txs:      len(env.txs),
+		receipts: len(env.receipts),
+	}
+}
+
+func (env *environment) restore(snap envSnapshot) {
+	env.state.StopPrefetcher()
+	env.state = snap.state
+	env.gasPool.SetGas(snap.gas)
+	env.header.GasUsed = snap.gasUsed
+	env.tcount = snap.tcount
+	env.txs = env.txs[:snap.txs]
+	env.receipts = env.receipts[:snap.receipts]
 }
 
 func (w *worker) rawCommitTransactions(env *environment, txs types.Transactions) error {
