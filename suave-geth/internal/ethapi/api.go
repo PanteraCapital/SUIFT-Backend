@@ -47,7 +47,6 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
-	suave "github.com/ethereum/go-ethereum/suave/core"
 	"github.com/tyler-smith/go-bip39"
 )
 
@@ -990,8 +989,16 @@ func (context *ChainContext) GetHeader(hash common.Hash, number uint64) *types.H
 	return header
 }
 
+var errConfidentialCall = errors.New("confidential execution is not available through calls, submit a signed confidential compute request with eth_sendRawTransaction")
+
 func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, blockOverrides *BlockOverrides, timeout time.Duration, globalGasCap uint64) (*core.ExecutionResult, error) {
 	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	// Confidential execution must only be reachable through a signed confidential
+	// compute request (eth_sendRawTransaction), never through unsigned calls.
+	if args.IsConfidential {
+		return nil, errConfidentialCall
+	}
 
 	state, header, err := b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
 	if state == nil || err != nil {
@@ -1020,42 +1027,6 @@ func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash 
 	blockCtx := core.NewEVMBlockContext(header, NewChainContext(ctx, b), nil)
 	if blockOverrides != nil {
 		blockOverrides.Apply(&blockCtx)
-	}
-
-	if args.IsConfidential {
-		if args.ExecutionNode == nil {
-			acc := b.AccountManager().Accounts()[0]
-			args.ExecutionNode = &acc
-		}
-
-		tx := args.ToTransaction()
-
-		state, header, err := b.StateAndHeaderByNumber(ctx, rpc.LatestBlockNumber)
-		if state == nil || err != nil {
-			return nil, err
-		}
-
-		msg := &core.Message{
-			Nonce:             tx.Nonce(),
-			GasLimit:          tx.Gas(),
-			GasPrice:          new(big.Int),
-			GasFeeCap:         new(big.Int),
-			GasTipCap:         new(big.Int),
-			To:                tx.To(),
-			Value:             tx.Value(),
-			Data:              tx.Data(),
-			AccessList:        tx.AccessList(),
-			SkipAccountChecks: true,
-		}
-
-		_, result, finalize, err := runMEVM(ctx, b, state, header, tx, msg, true)
-		if err != nil {
-			return nil, err
-		}
-		if err := finalize(); err != suave.ErrUnsignedFinalize {
-			return nil, err
-		}
-		return result, err
 	}
 
 	vmConfig := vm.Config{NoBaseFee: true, IsConfidential: false}
@@ -1879,7 +1850,7 @@ func (s *TransactionAPI) SendTransaction(ctx context.Context, args TransactionAr
 			return common.Hash{}, err
 		}
 
-		ntx, _, finalize, err := runMEVM(ctx, s.b, state, header, signed, msg, false)
+		ntx, _, finalize, err := runMEVM(ctx, s.b, state, header, signed, msg)
 		if err != nil {
 			return common.Hash{}, err
 		}
@@ -1929,7 +1900,7 @@ func (s *TransactionAPI) SendRawTransaction(ctx context.Context, input hexutil.B
 			return common.Hash{}, err
 		}
 
-		ntx, _, finalize, err := runMEVM(ctx, s.b, state, header, tx, msg, false)
+		ntx, _, finalize, err := runMEVM(ctx, s.b, state, header, tx, msg)
 		if err != nil {
 			return tx.Hash(), err
 		}
@@ -1944,7 +1915,7 @@ func (s *TransactionAPI) SendRawTransaction(ctx context.Context, input hexutil.B
 }
 
 // TODO: should be its own api
-func runMEVM(ctx context.Context, b Backend, state *state.StateDB, header *types.Header, tx *types.Transaction, msg *core.Message, isCall bool) (*types.Transaction, *core.ExecutionResult, func() error, error) {
+func runMEVM(ctx context.Context, b Backend, state *state.StateDB, header *types.Header, tx *types.Transaction, msg *core.Message) (*types.Transaction, *core.ExecutionResult, func() error, error) {
 	var cancel context.CancelFunc
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
@@ -1964,7 +1935,7 @@ func runMEVM(ctx context.Context, b Backend, state *state.StateDB, header *types
 
 	blockCtx := core.NewEVMBlockContext(header, NewChainContext(ctx, b), nil)
 	suaveCtx := b.SuaveContext(tx, confidentialRequest)
-	evm, storeFinalize, vmError := b.GetMEVM(ctx, msg, state, header, &vm.Config{IsConfidential: true, NoBaseFee: isCall}, &blockCtx, &suaveCtx)
+	evm, storeFinalize, vmError := b.GetMEVM(ctx, msg, state, header, &vm.Config{IsConfidential: true}, &blockCtx, &suaveCtx)
 
 	// Wait for the context to be done and cancel the evm. Even if the
 	// EVM has finished, cancelling may be done (repeatedly)

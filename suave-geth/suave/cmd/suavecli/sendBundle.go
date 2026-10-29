@@ -14,9 +14,9 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
+	"golang.org/x/exp/slices"
 )
 
 func cmdSendBundle() {
@@ -53,24 +53,16 @@ func cmdSendBundle() {
 	RequireNoErrorf(err, "could not connect to goerli rpc: %v", err)
 
 	genesis := core.DefaultSuaveGenesisBlock()
-	chainId := hexutil.Big(*genesis.Config.ChainID)
 
 	goerliSigner := types.LatestSigner(core.DefaultGoerliGenesisBlock().Config)
 	suaveSigner := types.NewSuaveSigner(genesis.Config.ChainID)
 
-	gas := hexutil.Uint64(1000000)
-
 	{ // Sanity check
-		var result string
-		rpcErr := suaveClient.Call(&result, "eth_call", ethapi.TransactionArgs{
-			To:             &isConfidentialAddress,
-			Gas:            &gas,
-			IsConfidential: true,
-			ChainID:        &chainId,
-		}, "latest")
-		RequireNoErrorf(rpcErr, "could not call IsConfidential precompile: %v", unwrapPeekerError(rpcErr))
-		if result != "0x01" {
-			utils.Fatalf("unexpected result from confidential call %s, expected 0x01", result)
+		var executionAddresses []common.Address
+		rpcErr := suaveClient.Call(&executionAddresses, "eth_executionAddress")
+		RequireNoErrorf(rpcErr, "could not call eth_executionAddress: %v", rpcErr)
+		if !slices.Contains(executionAddresses, executionNodeAddress) {
+			utils.Fatalf("suave node does not serve execution node %s, available: %v", executionNodeAddress, executionAddresses)
 		}
 
 		log.Info("Suave node seems sane, continuing")
@@ -167,33 +159,17 @@ func cmdSendBundle() {
 
 	log.Info("Submitted bundle to suave", "suaveTxHashes", suaveTxHashes)
 
-	{ // Bid mempool sanity check
-		packedCondBytes, err := suaveLibAbi.Methods["fetchBids"].Inputs.Pack(minTargetBlock)
-		RequireNoErrorf(err, "could not pack fetchBids: %v", err)
-
-		var result hexutil.Bytes
-		rpcErr := suaveClient.Call(&result, "eth_call", ethapi.TransactionArgs{
-			To:             &fetchBidsAddress,
-			Gas:            &gas,
-			IsConfidential: true,
-			ChainID:        &chainId,
-			Data:           (*hexutil.Bytes)(&packedCondBytes),
-		}, "latest")
-		RequireNoErrorf(rpcErr, "could not pack fetchBids: %v", unwrapPeekerError(rpcErr))
-		unpackedBids, err := suaveLibAbi.Methods["fetchBids"].Outputs.Unpack(result)
-		RequireNoErrorf(err, "could not unpack fetchBids response %v: %v", result, err)
-
-		bids := unpackedBids[0].([]struct {
-			Id                  [16]uint8        "json:\"id\""
-			DecryptionCondition uint64           "json:\"decryptionCondition\""
-			AllowedPeekers      []common.Address "json:\"allowedPeekers\""
-		})
-
-		if len(bids) == 0 {
-			utils.Fatalf("no bids fetched, expected at least one. result: %v", result)
+	{ // Mempool sanity check
+		for _, txHash := range suaveTxHashes {
+			var suaveTx map[string]interface{}
+			rpcErr := suaveClient.Call(&suaveTx, "eth_getTransactionByHash", txHash)
+			RequireNoErrorf(rpcErr, "could not call eth_getTransactionByHash on suave: %v", rpcErr)
+			if suaveTx == nil {
+				utils.Fatalf("submitted suave transaction %s not found", txHash)
+			}
 		}
 
-		log.Info("Mempool seems sane, fetched", "bids", bids, "targetBlock", minTargetBlock)
+		log.Info("Mempool seems sane, found", "suaveTxHashes", suaveTxHashes)
 	}
 
 	// TODO: confirm (maybe in background) that the transactions all landed in blocks
