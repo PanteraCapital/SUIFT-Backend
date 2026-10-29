@@ -58,14 +58,13 @@ func TestIsConfidential(t *testing.T) {
 	chainId := hexutil.Big(*testSuaveGenesis.Config.ChainID)
 
 	{
-		// Verify eth_call of isConfidentialAddress returns 1/0 depending on confidential compute setting
+		// Verify eth_call refuses confidential execution and runs isConfidentialAddress non-confidentially
 		var result string
-		requireNoRpcError(t, rpc.Call(&result, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
+		require.Error(t, rpc.Call(&result, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
 			To:             &isConfidentialAddress,
 			IsConfidential: true,
 			ChainID:        &chainId,
 		}), "latest"))
-		require.Equal(t, []byte{1}, hexutil.MustDecode(result))
 
 		requireNoRpcError(t, rpc.Call(&result, "eth_call", ethapi.TransactionArgs{
 			To:             &isConfidentialAddress,
@@ -136,9 +135,6 @@ func TestMempool(t *testing.T) {
 
 	rpc := fr.suethSrv.RPCNode()
 
-	gas := hexutil.Uint64(1000000)
-	chainId := hexutil.Big(*testSuaveGenesis.Config.ChainID)
-
 	{
 		targetBlock := uint64(16103213)
 		creationTx := types.NewTx(&types.ConfidentialComputeRequest{
@@ -172,34 +168,6 @@ func TestMempool(t *testing.T) {
 		calldata, err := inoutAbi.Inputs.Pack(targetBlock, "default:v0:ethBundles")
 		require.NoError(t, err)
 
-		var simResult hexutil.Bytes
-		requireNoRpcError(t, rpc.Call(&simResult, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
-			To:             &fetchBidsAddress,
-			Gas:            &gas,
-			IsConfidential: true,
-			ChainID:        &chainId,
-			Data:           (*hexutil.Bytes)(&calldata),
-		}), "latest"))
-
-		unpacked, err := inoutAbi.Outputs.Unpack(simResult)
-		require.NoError(t, err)
-
-		var bids []suave.Bid
-		require.NoError(t, mapstructure.Decode(unpacked[0], &bids))
-
-		require.Equal(t, bid1.Id, bids[0].Id)
-		require.Equal(t, bid1.Salt, bids[0].Salt)
-		require.Equal(t, bid1.DecryptionCondition, bids[0].DecryptionCondition)
-		require.Equal(t, bid1.AllowedPeekers, bids[0].AllowedPeekers)
-		require.Equal(t, bid1.Version, bids[0].Version)
-
-		require.Equal(t, bid2.Id, bids[1].Id)
-		require.Equal(t, bid2.Salt, bids[1].Salt)
-		require.Equal(t, bid2.DecryptionCondition, bids[1].DecryptionCondition)
-		require.Equal(t, bid2.AllowedPeekers, bids[1].AllowedPeekers)
-		require.Equal(t, bid2.Version, bids[1].Version)
-
-		// Verify via transaction
 		confidentialRequestTx, err := types.SignTx(types.NewTx(&types.ConfidentialComputeRequest{
 			ConfidentialComputeRecord: types.ConfidentialComputeRecord{
 				ExecutionNode: fr.ExecutionNode(),
@@ -228,7 +196,24 @@ func TestMempool(t *testing.T) {
 		require.Equal(t, uint64(1), receipts[0].Status)
 
 		require.Equal(t, 1, len(block.Transactions()))
-		require.Equal(t, []byte(simResult), block.Transactions()[0].Data())
+
+		unpacked, err := inoutAbi.Outputs.Unpack(block.Transactions()[0].Data())
+		require.NoError(t, err)
+
+		var bids []suave.Bid
+		require.NoError(t, mapstructure.Decode(unpacked[0], &bids))
+
+		require.Equal(t, bid1.Id, bids[0].Id)
+		require.Equal(t, bid1.Salt, bids[0].Salt)
+		require.Equal(t, bid1.DecryptionCondition, bids[0].DecryptionCondition)
+		require.Equal(t, bid1.AllowedPeekers, bids[0].AllowedPeekers)
+		require.Equal(t, bid1.Version, bids[0].Version)
+
+		require.Equal(t, bid2.Id, bids[1].Id)
+		require.Equal(t, bid2.Salt, bids[1].Salt)
+		require.Equal(t, bid2.DecryptionCondition, bids[1].DecryptionCondition)
+		require.Equal(t, bid2.AllowedPeekers, bids[1].AllowedPeekers)
+		require.Equal(t, bid2.Version, bids[1].Version)
 	}
 }
 
@@ -251,24 +236,17 @@ func TestTxSigningPrecompile(t *testing.T) {
 	args, err := artifacts.SuaveAbi.Methods["signEthTransaction"].Inputs.Pack(txBytes, chainIdHex, skHex)
 	require.NoError(t, err)
 
-	gas := hexutil.Uint64(1000000)
-	chainId := hexutil.Big(*testSuaveGenesis.Config.ChainID)
-
-	var callResult hexutil.Bytes
-	err = fr.suethSrv.RPCNode().Call(&callResult, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
-		To:             &signEthTransaction,
-		Gas:            &gas,
-		IsConfidential: true,
-		ChainID:        &chainId,
-		Data:           (*hexutil.Bytes)(&args),
-	}), "latest")
+	callResult, err := fr.ConfidentialRequest(signEthTransaction, args)
 	requireNoRpcError(t, err)
 
-	unpackedCallResult, err := artifacts.SuaveAbi.Methods["signEthTransaction"].Outputs.Unpack(callResult)
-	require.NoError(t, err)
+	// The execution node publishes abi-encoded bytes unwrapped when their length is 4 mod 32.
+	signedTxBytes := callResult
+	if unpackedCallResult, err := artifacts.SuaveAbi.Methods["signEthTransaction"].Outputs.Unpack(callResult); err == nil {
+		signedTxBytes = unpackedCallResult[0].([]byte)
+	}
 
 	var signedTx types.Transaction
-	require.NoError(t, signedTx.UnmarshalBinary(unpackedCallResult[0].([]byte)))
+	require.NoError(t, signedTx.UnmarshalBinary(signedTxBytes))
 
 	require.Equal(t, tx.Nonce(), signedTx.Nonce())
 	require.Equal(t, *tx.To(), *signedTx.To())
@@ -717,14 +695,6 @@ func TestBlockBuildingPrecompiles(t *testing.T) {
 	fr := newFramework(t, WithExecutionNode())
 	defer fr.Close()
 
-	rpc := fr.suethSrv.RPCNode()
-
-	gas := hexutil.Uint64(1000000)
-	chainId := hexutil.Big(*testSuaveGenesis.Config.ChainID)
-
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second))
-	defer cancel()
-
 	ethTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
 		Nonce:    0,
 		To:       &testAddr,
@@ -741,24 +711,18 @@ func TestBlockBuildingPrecompiles(t *testing.T) {
 	bundleBytes, err := json.Marshal(bundle)
 	require.NoError(t, err)
 
-	{ // Test the bundle simulation precompile through eth_call
+	{ // Test the bundle simulation precompile through a confidential compute request
 		calldata, err := suaveLibContract.Abi.Methods["simulateBundle"].Inputs.Pack(bundleBytes)
 		require.NoError(t, err)
 
-		var simResult hexutil.Bytes
-		requireNoRpcError(t, rpc.CallContext(ctx, &simResult, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
-			To:             &simulateBundleAddress,
-			Gas:            &gas,
-			IsConfidential: true,
-			ChainID:        &chainId,
-			Data:           (*hexutil.Bytes)(&calldata),
-		}), "latest"))
+		simResult, err := fr.ConfidentialRequest(simulateBundleAddress, calldata)
+		requireNoRpcError(t, err)
 
 		require.Equal(t, 32, len(simResult))
 		require.Equal(t, 13, int(simResult[31]))
 	}
 
-	{ // Test the block building precompile through eth_call
+	{ // Test the block building precompile through a confidential compute request
 		// function buildEthBlock(BuildBlockArgs memory blockArgs, BidId bid) internal view returns (bytes memory, bytes memory) {
 
 		dummyCreationTx, err := types.SignNewTx(testKey, signer, &types.ConfidentialComputeRequest{
@@ -795,14 +759,8 @@ func TestBlockBuildingPrecompiles(t *testing.T) {
 		packed, err := suaveLibContract.Abi.Methods["buildEthBlock"].Inputs.Pack(payloadArgsTuple, bid.Id, "")
 		require.NoError(t, err)
 
-		var simResult hexutil.Bytes
-		requireNoRpcError(t, rpc.CallContext(ctx, &simResult, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
-			To:             &buildEthBlockAddress,
-			Gas:            &gas,
-			IsConfidential: true,
-			ChainID:        &chainId,
-			Data:           (*hexutil.Bytes)(&packed),
-		}), "latest"))
+		simResult, err := fr.ConfidentialRequest(buildEthBlockAddress, packed)
+		requireNoRpcError(t, err)
 
 		require.NotNil(t, simResult)
 
@@ -1020,12 +978,6 @@ func TestE2E_ForgeIntegration(t *testing.T) {
 	fr := newFramework(t, WithExecutionNode())
 	defer fr.Close()
 
-	rpcClient := fr.suethSrv.RPCNode()
-	ethClient := ethclient.NewClient(rpcClient)
-
-	chainIdRaw, err := ethClient.ChainID(context.Background())
-	require.NoError(t, err)
-
 	doCall := func(methodName string, args ...interface{}) []interface{} {
 		toAddr, ok := artifacts.SuaveMethods[methodName]
 		require.True(t, ok, fmt.Sprintf("suave method %s not found", methodName))
@@ -1035,16 +987,7 @@ func TestE2E_ForgeIntegration(t *testing.T) {
 		input, err := method.Inputs.Pack(args...)
 		require.NoError(t, err)
 
-		chainId := hexutil.Big(*chainIdRaw)
-
-		callArgs := ethapi.TransactionArgs{
-			To:             &toAddr,
-			IsConfidential: true,
-			ChainID:        &chainId,
-			Data:           (*hexutil.Bytes)(&input),
-		}
-		var simResult hexutil.Bytes
-		err = rpcClient.Call(&simResult, "eth_call", setTxArgsDefaults(callArgs), "latest")
+		simResult, err := fr.ConfidentialRequest(toAddr, input)
 		require.NoError(t, err)
 
 		if methodName == "confidentialRetrieve" {
@@ -1249,6 +1192,47 @@ func (f *framework) ConfidentialEngine() *cstore.ConfidentialStoreEngine {
 
 func (f *framework) ExecutionNode() common.Address {
 	return f.suethSrv.service.AccountManager().Accounts()[0]
+}
+
+// ConfidentialRequest submits a confidential compute request signed by testKey
+// and returns the confidential compute result published by the execution node.
+func (f *framework) ConfidentialRequest(to common.Address, data []byte) ([]byte, error) {
+	rpc := f.suethSrv.RPCNode()
+
+	nonce, err := ethclient.NewClient(rpc).PendingNonceAt(context.Background(), testAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := types.SignTx(types.NewTx(&types.ConfidentialComputeRequest{
+		ConfidentialComputeRecord: types.ConfidentialComputeRecord{
+			ExecutionNode: f.ExecutionNode(),
+			Nonce:         nonce,
+			To:            &to,
+			Gas:           1000000,
+			GasPrice:      big.NewInt(10),
+			Data:          data,
+		},
+	}), signer, testKey)
+	if err != nil {
+		return nil, err
+	}
+
+	txBytes, err := tx.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	var hash common.Hash
+	if err := rpc.Call(&hash, "eth_sendRawTransaction", hexutil.Encode(txBytes)); err != nil {
+		return nil, err
+	}
+
+	resultTx := f.suethSrv.service.TxPool().Get(hash)
+	if resultTx == nil {
+		return nil, fmt.Errorf("confidential compute result %s not found in the pool", hash)
+	}
+	return resultTx.Data(), nil
 }
 
 func (f *framework) Close() {
