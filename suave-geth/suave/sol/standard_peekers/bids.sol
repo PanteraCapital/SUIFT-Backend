@@ -163,6 +163,9 @@ struct EgpBidPair {
 
 contract EthBlockBidContract is AnyBidContract {
 
+	address constant ANY_PEEKER = 0xC8df3686b4Afb2BB53e60EAe97EF043FE03Fb829;
+	uint256 constant RETRIEVE_GAS = 10000;
+
 	event BuilderBoostBidEvent(
 		Suave.BidId bidId,
 		bytes builderBid
@@ -186,69 +189,91 @@ contract EthBlockBidContract is AnyBidContract {
 		Suave.Bid[] memory allShareMatchBids = Suave.fetchBids(blockHeight, "mevshare:v0:matchBids");
 		Suave.Bid[] memory allShareUserBids = Suave.fetchBids(blockHeight, "mevshare:v0:unmatchedBundles");
 
-		if (allShareUserBids.length == 0) {
-			revert Suave.PeekerReverted(address(this), "no bids");
+		// Only matches that this builder can use are considered, so that an
+		// unusable match never replaces the user bid it refers to.
+		Suave.BidId[] memory matchIds = new Suave.BidId[](allShareMatchBids.length);
+		Suave.BidId[] memory matchedUserIds = new Suave.BidId[](allShareMatchBids.length);
+		uint64[] memory matchEgps = new uint64[](allShareMatchBids.length);
+		uint nMatches = 0;
+		for (uint j = 0; j < allShareMatchBids.length; j++) {
+			Suave.Bid memory matchBid = allShareMatchBids[j];
+			if (!isBuildable(matchBid)) {
+				continue;
+			}
+			(bool okMerged, Suave.BidId userBidId, Suave.BidId matchBidId) = tryRetrieveMergedBidIds(matchBid.id);
+			if (!okMerged || !idsEqual(matchBidId, matchBid.id)) {
+				continue;
+			}
+			(bool okEgp, uint64 matchEgp) = tryRetrieveEgp(matchBid.id, "mevshare:v0:ethBundleSimResults");
+			if (!okEgp) {
+				continue;
+			}
+			matchIds[nMatches] = matchBid.id;
+			matchedUserIds[nMatches] = userBidId;
+			matchEgps[nMatches] = matchEgp;
+			nMatches++;
 		}
 
-		Suave.Bid[] memory allBids = new Suave.Bid[](allShareUserBids.length);
+		EgpBidPair[] memory bidsByEGP = new EgpBidPair[](allShareUserBids.length);
+		uint n = 0;
 		for (uint i = 0; i < allShareUserBids.length; i++) {
+			Suave.Bid memory userBid = allShareUserBids[i];
+			if (!isBuildable(userBid)) {
+				continue;
+			}
+			(bool okEgp, uint64 egp) = tryRetrieveEgp(userBid.id, "mevshare:v0:ethBundleSimResults");
+			if (!okEgp) {
+				continue;
+			}
+
 			// TODO: sort matches by egp first!
-			Suave.Bid memory bidToInsert = allShareUserBids[i]; // will be updated with the best match if any
-			for (uint j = 0; j < allShareMatchBids.length; j++) {
-				// TODO: should be done once at the start and sorted
-				Suave.BidId[] memory mergedBidIds = abi.decode(Suave.confidentialRetrieve(allShareMatchBids[j].id, "mevshare:v0:mergedBids"), (Suave.BidId[]));
-				if (idsEqual(mergedBidIds[0], allShareUserBids[i].id)) {
-					bidToInsert = allShareMatchBids[j];
+			EgpBidPair memory bidToInsert = EgpBidPair(egp, userBid.id); // will be updated with the best match if any
+			for (uint j = 0; j < nMatches; j++) {
+				if (idsEqual(matchedUserIds[j], userBid.id)) {
+					bidToInsert = EgpBidPair(matchEgps[j], matchIds[j]);
 					break;
 				}
 			}
-			allBids[i] = bidToInsert;
+			bidsByEGP[n] = bidToInsert;
+			n++;
 		}
 
-		EgpBidPair[] memory bidsByEGP = new EgpBidPair[](allBids.length);
-		for (uint i = 0; i < allBids.length; i++) {
-			bytes memory simResults = Suave.confidentialRetrieve(allBids[i].id, "mevshare:v0:ethBundleSimResults");
-			uint64 egp = abi.decode(simResults, (uint64));
-			bidsByEGP[i] = EgpBidPair(egp, allBids[i].id);
+		if (n == 0) {
+			revert Suave.PeekerReverted(address(this), "no bids");
 		}
 
-		// Bubble sort, cause why not
-		uint n = bidsByEGP.length;
-		for (uint i = 0; i < n - 1; i++) {
-			for (uint j = i + 1; j < n; j++) {
-				if (bidsByEGP[i].egp < bidsByEGP[j].egp) {
-					EgpBidPair memory temp = bidsByEGP[i];
-					bidsByEGP[i] = bidsByEGP[j];
-					bidsByEGP[j] = temp;
-				}
-			}
-		}
-
-		Suave.BidId[] memory allBidIds = new Suave.BidId[](allBids.length);
-		for (uint i = 0; i < bidsByEGP.length; i++) {
-			allBidIds[i] = bidsByEGP[i].bidId;
-		}
-
-		return buildAndEmit(blockArgs, blockHeight, allBidIds, "mevshare:v0");
+		return buildAndEmit(blockArgs, blockHeight, sortedBidIds(bidsByEGP, n), "mevshare:v0");
 	}
 
 	function buildFromPool(Suave.BuildBlockArgs memory blockArgs, uint64 blockHeight) public returns (bytes memory) {
 		require(Suave.isConfidential());
 
 		Suave.Bid[] memory allBids = Suave.fetchBids(blockHeight, "default:v0:ethBundles");
-		if (allBids.length == 0) {
+
+		EgpBidPair[] memory bidsByEGP = new EgpBidPair[](allBids.length);
+		uint n = 0;
+		for (uint i = 0; i < allBids.length; i++) {
+			if (!isBuildable(allBids[i])) {
+				continue;
+			}
+			(bool okEgp, uint64 egp) = tryRetrieveEgp(allBids[i].id, "default:v0:ethBundleSimResults");
+			if (!okEgp) {
+				continue;
+			}
+			bidsByEGP[n] = EgpBidPair(egp, allBids[i].id);
+			n++;
+		}
+
+		if (n == 0) {
 			revert Suave.PeekerReverted(address(this), "no bids");
 		}
 
-		EgpBidPair[] memory bidsByEGP = new EgpBidPair[](allBids.length);
-		for (uint i = 0; i < allBids.length; i++) {
-			bytes memory simResults = Suave.confidentialRetrieve(allBids[i].id, "default:v0:ethBundleSimResults");
-			uint64 egp = abi.decode(simResults, (uint64));
-			bidsByEGP[i] = EgpBidPair(egp, allBids[i].id);
-		}
+		return buildAndEmit(blockArgs, blockHeight, sortedBidIds(bidsByEGP, n), "");
+	}
 
+	// Sorts the first n pairs by egp, highest first.
+	function sortedBidIds(EgpBidPair[] memory bidsByEGP, uint n) internal pure returns (Suave.BidId[] memory) {
 		// Bubble sort, cause why not
-		uint n = bidsByEGP.length;
 		for (uint i = 0; i < n - 1; i++) {
 			for (uint j = i + 1; j < n; j++) {
 				if (bidsByEGP[i].egp < bidsByEGP[j].egp) {
@@ -259,12 +284,72 @@ contract EthBlockBidContract is AnyBidContract {
 			}
 		}
 
-		Suave.BidId[] memory allBidIds = new Suave.BidId[](allBids.length);
-		for (uint i = 0; i < bidsByEGP.length; i++) {
+		Suave.BidId[] memory allBidIds = new Suave.BidId[](n);
+		for (uint i = 0; i < n; i++) {
 			allBidIds[i] = bidsByEGP[i].bidId;
 		}
+		return allBidIds;
+	}
 
-		return buildAndEmit(blockArgs, blockHeight, allBidIds, "");
+	// fetchBids returns every bid in a namespace, including bids this builder
+	// cannot use. buildEthBlock only accepts bids that allow its precompile and
+	// one of its callers; the caller side is covered by the confidential
+	// retrieve that every candidate bid also has to pass.
+	function isBuildable(Suave.Bid memory bid) internal pure returns (bool) {
+		for (uint i = 0; i < bid.allowedPeekers.length; i++) {
+			if (bid.allowedPeekers[i] == ANY_PEEKER || bid.allowedPeekers[i] == Suave.BUILD_ETH_BLOCK) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	function tryRetrieveEgp(Suave.BidId bidId, string memory key) internal view returns (bool, uint64) {
+		(bool ok, bytes memory data) = tryRetrieve(bidId, key, 32);
+		if (!ok) {
+			return (false, 0);
+		}
+		uint256 egp = abi.decode(data, (uint256));
+		if (egp > type(uint64).max) {
+			return (false, 0);
+		}
+		return (true, uint64(egp));
+	}
+
+	// Expects abi.encode(BidId[2]{userBidId, matchBidId}) as stored by MevShareBidContract.newMatch.
+	function tryRetrieveMergedBidIds(Suave.BidId bidId) internal view returns (bool, Suave.BidId, Suave.BidId) {
+		(bool ok, bytes memory data) = tryRetrieve(bidId, "mevshare:v0:mergedBids", 128);
+		if (!ok) {
+			return (false, Suave.BidId.wrap(0), Suave.BidId.wrap(0));
+		}
+		(uint256 offset, uint256 length, bytes32 first, bytes32 second) = abi.decode(data, (uint256, uint256, bytes32, bytes32));
+		if (offset != 32 || length != 2) {
+			return (false, Suave.BidId.wrap(0), Suave.BidId.wrap(0));
+		}
+		return (true, Suave.BidId.wrap(bytes16(first)), Suave.BidId.wrap(bytes16(second)));
+	}
+
+	// Like Suave.confidentialRetrieve, but reports failure instead of reverting
+	// and only copies the value into memory when it has the expected size, so a
+	// bid with unreadable, missing or oversized data cannot revert the build.
+	// A failing precompile consumes all gas forwarded to it, so only a fixed
+	// amount well above the precompile's cost is forwarded.
+	function tryRetrieve(Suave.BidId bidId, string memory key, uint256 size) internal view returns (bool ok, bytes memory data) {
+		bytes memory input = abi.encode(bidId, key);
+		address target = Suave.CONFIDENTIAL_RETRIEVE;
+		uint256 callGas = RETRIEVE_GAS;
+		uint256 returned;
+		assembly {
+			ok := staticcall(callGas, target, add(input, 0x20), mload(input), 0, 0)
+			returned := returndatasize()
+		}
+		if (!ok || returned != size) {
+			return (false, data);
+		}
+		data = new bytes(size);
+		assembly {
+			returndatacopy(add(data, 0x20), 0, size)
+		}
 	}
 
 	function buildAndEmit(Suave.BuildBlockArgs memory blockArgs, uint64 blockHeight, Suave.BidId[] memory bids, string memory namespace) public virtual returns (bytes memory) {
