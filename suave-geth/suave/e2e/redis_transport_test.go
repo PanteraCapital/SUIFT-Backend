@@ -14,6 +14,8 @@ import (
 )
 
 func TestRedisBackends(t *testing.T) {
+	allowBuilderContract(t, newBlockBidAddress)
+
 	withMiniredisTransportOpt := WithRedisTransportOpt(t)
 
 	fr1 := newFramework(t, WithExecutionNode(), WithRedisStoreBackend(), withMiniredisTransportOpt)

@@ -499,6 +499,8 @@ func prepareMevShareBackrun(t *testing.T, shareBidId types.BidId) (*types.Transa
 }
 
 func TestMevShare(t *testing.T) {
+	allowBuilderContract(t, newBlockBidAddress)
+
 	// 1. craft mevshare transaction
 	//   1a. confirm submission
 	// 2. send backrun txn
@@ -758,8 +760,8 @@ func TestBlockBuildingPrecompiles(t *testing.T) {
 		require.Equal(t, 13, int(simResult[31]))
 	}
 
-	{ // Test the block building precompile through eth_call
-		// function buildEthBlock(BuildBlockArgs memory blockArgs, BidId bid) internal view returns (bytes memory, bytes memory) {
+	{ // The block building precompile only signs for the configured builder contract, never for a direct eth_call
+		allowBuilderContract(t, newBlockBidAddress)
 
 		dummyCreationTx, err := types.SignNewTx(testKey, signer, &types.ConfidentialComputeRequest{
 			ConfidentialComputeRecord: types.ConfidentialComputeRecord{
@@ -796,33 +798,21 @@ func TestBlockBuildingPrecompiles(t *testing.T) {
 		require.NoError(t, err)
 
 		var simResult hexutil.Bytes
-		requireNoRpcError(t, rpc.CallContext(ctx, &simResult, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
+		err = rpc.CallContext(ctx, &simResult, "eth_call", setTxArgsDefaults(ethapi.TransactionArgs{
 			To:             &buildEthBlockAddress,
 			Gas:            &gas,
 			IsConfidential: true,
 			ChainID:        &chainId,
 			Data:           (*hexutil.Bytes)(&packed),
-		}), "latest"))
-
-		require.NotNil(t, simResult)
-
-		unpacked, err := suaveLibContract.Abi.Methods["buildEthBlock"].Outputs.Unpack(simResult)
-		require.NoError(t, err)
-
-		// TODO: test builder bid
-		var envelope *engine.ExecutionPayloadEnvelope
-		require.NoError(t, json.Unmarshal(unpacked[1].([]byte), &envelope))
-		require.Equal(t, 2, len(envelope.ExecutionPayload.Transactions))
-
-		var tx types.Transaction
-		require.NoError(t, tx.UnmarshalBinary(envelope.ExecutionPayload.Transactions[0]))
-
-		require.Equal(t, ethTx.Data(), tx.Data())
-		require.Equal(t, ethTx.Hash(), tx.Hash())
+		}), "latest")
+		require.ErrorContains(t, err, "buildEthBlock caller not authorized")
+		require.Empty(t, simResult)
 	}
 }
 
 func TestBlockBuildingContract(t *testing.T) {
+	allowBuilderContract(t, newBlockBidAddress)
+
 	fr := newFramework(t, WithExecutionNode())
 	defer fr.Close()
 
@@ -936,6 +926,7 @@ func TestRelayBlockSubmissionContract(t *testing.T) {
 
 		from, _ := types.Sender(signer, tx)
 		ethBlockBidSenderAddr = crypto.CreateAddress(from, tx.Nonce())
+		allowBuilderContract(t, ethBlockBidSenderAddr)
 
 		txBytes, err := tx.MarshalBinary()
 		require.NoError(t, err)
@@ -1417,6 +1408,10 @@ func progressChain(t *testing.T, ethservice *eth.Ethereum, parent *types.Header)
 	require.Equal(t, 1, n)
 
 	return block
+}
+
+func allowBuilderContract(t *testing.T, builder common.Address) {
+	t.Setenv("SUAVE_BUILDER_CONTRACT", builder.Hex())
 }
 
 func requireNoRpcError(t *testing.T, rpcErr error) {
