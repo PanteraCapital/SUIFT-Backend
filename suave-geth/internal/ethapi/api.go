@@ -1790,8 +1790,27 @@ func (s *TransactionAPI) GetTransactionReceipt(ctx context.Context, hash common.
 	return fields, nil
 }
 
+// errRemoteSigning is returned when an HTTP or WebSocket client asks the node to
+// sign with one of its own accounts.
+var errRemoteSigning = errors.New("signing with node accounts is not available over HTTP or WebSocket")
+
+// checkLocalSigningCaller rejects requests that reached the node over a network
+// transport. Unlocked node accounts include the Kettle execution key, which
+// must only sign the results of confidential compute requests.
+func checkLocalSigningCaller(ctx context.Context) error {
+	switch rpc.PeerInfoFromContext(ctx).Transport {
+	case "", "ipc":
+		return nil
+	default:
+		return errRemoteSigning
+	}
+}
+
 // sign is a helper function that signs a transaction with the private key of the given address.
-func (s *TransactionAPI) sign(addr common.Address, tx *types.Transaction) (*types.Transaction, error) {
+func (s *TransactionAPI) sign(ctx context.Context, addr common.Address, tx *types.Transaction) (*types.Transaction, error) {
+	if err := checkLocalSigningCaller(ctx); err != nil {
+		return nil, err
+	}
 	// Look up the wallet containing the requested signer
 	account := accounts.Account{Address: addr}
 
@@ -2025,7 +2044,10 @@ func runMEVM(ctx context.Context, b Backend, state *state.StateDB, header *types
 // The account associated with addr must be unlocked.
 //
 // https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_sign
-func (s *TransactionAPI) Sign(addr common.Address, data hexutil.Bytes) (hexutil.Bytes, error) {
+func (s *TransactionAPI) Sign(ctx context.Context, addr common.Address, data hexutil.Bytes) (hexutil.Bytes, error) {
+	if err := checkLocalSigningCaller(ctx); err != nil {
+		return nil, err
+	}
 	// Look up the wallet containing the requested signer
 	account := accounts.Account{Address: addr}
 
@@ -2068,7 +2090,7 @@ func (s *TransactionAPI) SignTransaction(ctx context.Context, args TransactionAr
 	if err := checkTxFee(tx.GasPrice(), tx.Gas(), s.b.RPCTxFeeCap()); err != nil {
 		return nil, err
 	}
-	signed, err := s.sign(args.from(), tx)
+	signed, err := s.sign(ctx, args.from(), tx)
 	if err != nil {
 		return nil, err
 	}
@@ -2142,7 +2164,7 @@ func (s *TransactionAPI) Resend(ctx context.Context, sendArgs TransactionArgs, g
 			if gasLimit != nil && *gasLimit != 0 {
 				sendArgs.Gas = gasLimit
 			}
-			signedTx, err := s.sign(sendArgs.from(), sendArgs.toTransaction())
+			signedTx, err := s.sign(ctx, sendArgs.from(), sendArgs.toTransaction())
 			if err != nil {
 				return common.Hash{}, err
 			}

@@ -117,7 +117,6 @@ func defaultNodeConfig() node.Config {
 	cfg.HTTPModules = append(cfg.HTTPModules, "eth", "suavex")
 	cfg.WSModules = append(cfg.WSModules, "eth", "suavex")
 	cfg.IPCPath = "geth.ipc"
-	cfg.InsecureUnlockAllowed = true
 	return cfg
 }
 
