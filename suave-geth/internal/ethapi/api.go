@@ -47,7 +47,6 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
-	suave "github.com/ethereum/go-ethereum/suave/core"
 	"github.com/tyler-smith/go-bip39"
 )
 
@@ -1048,14 +1047,13 @@ func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash 
 			SkipAccountChecks: true,
 		}
 
-		_, result, finalize, err := runMEVM(ctx, b, state, header, tx, msg, true)
+		// A call is a simulation: its transactional store is discarded, never
+		// finalized, so no bids or writes from it reach the confidential store.
+		_, result, _, err := runMEVM(ctx, b, state, header, tx, msg, true)
 		if err != nil {
 			return nil, err
 		}
-		if err := finalize(); err != suave.ErrUnsignedFinalize {
-			return nil, err
-		}
-		return result, err
+		return result, nil
 	}
 
 	vmConfig := vm.Config{NoBaseFee: true, IsConfidential: false}

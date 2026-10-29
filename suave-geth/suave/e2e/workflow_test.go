@@ -1063,14 +1063,31 @@ func TestE2E_ForgeIntegration(t *testing.T) {
 	var bid types.Bid
 	require.NoError(t, mapstructure.Decode(bidRaw[0], &bid))
 
+	// eth_call is a simulation, so the bid it created is not committed.
 	bidsRaw := doCall("fetchBids", uint64(0), "default:v0:ethBundles")
 	var bids []types.Bid
+	require.NoError(t, mapstructure.Decode(bidsRaw[0], &bids))
+	require.Empty(t, bids)
+
+	committedBid := suave.Bid{
+		Id:                  bid.Id,
+		Salt:                bid.Salt,
+		DecryptionCondition: bid.DecryptionCondition,
+		AllowedPeekers:      bid.AllowedPeekers,
+		AllowedStores:       bid.AllowedStores,
+		Version:             bid.Version,
+	}
+	require.NoError(t, fr.ConfidentialStoreBackend().InitializeBid(committedBid))
+	val := []byte{0x1, 0x2, 0x3}
+	_, err = fr.ConfidentialStoreBackend().Store(committedBid, common.Address{}, "a", val)
+	require.NoError(t, err)
+
+	bidsRaw = doCall("fetchBids", uint64(0), "default:v0:ethBundles")
 	require.NoError(t, mapstructure.Decode(bidsRaw[0], &bids))
 	require.Len(t, bids, 1)
 	require.Equal(t, bids[0].Id, bid.Id)
 
-	val := []byte{0x1, 0x2, 0x3}
-	doCall("confidentialStore", bid.Id, "a", val)
+	doCall("confidentialStore", bid.Id, "a", []byte{0x4, 0x5, 0x6})
 
 	valRaw := doCall("confidentialRetrieve", bid.Id, "a")
 	require.Equal(t, val, valRaw[0])
