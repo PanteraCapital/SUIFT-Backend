@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1939,6 +1940,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		} else if accs := ks.Accounts(); len(accs) > 0 {
 			developer = ks.Accounts()[0]
 		} else {
+			// An ephemeral keystore is never reopened, so its key does not need a
+			// passphrase anyone knows.
+			if keydir, _ := stack.Config().KeyDirConfig(); keydir == "" && passphrase == "" {
+				secret := make([]byte, 32)
+				if _, err := crand.Read(secret); err != nil {
+					Fatalf("Failed to generate developer account passphrase: %v", err)
+				}
+				passphrase = hex.EncodeToString(secret)
+			}
 			developer, err = ks.NewAccount(passphrase)
 			if err != nil {
 				Fatalf("Failed to create developer account: %v", err)
@@ -1948,7 +1958,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		// the miner will fail to start.
 		cfg.Miner.Etherbase = developer.Address
 
-		if err := ks.Unlock(developer, passphrase); err != nil {
+		if !stack.Config().InsecureUnlockAllowed && stack.Config().RemoteRPCEnabled() {
+			log.Warn("Not unlocking developer account because HTTP or WebSocket RPC listens on a non-loopback interface (use --allow-insecure-unlock to override)", "address", developer.Address)
+		} else if err := ks.Unlock(developer, passphrase); err != nil {
 			Fatalf("Failed to unlock developer account: %v", err)
 		}
 		log.Info("Using developer account", "address", developer.Address)

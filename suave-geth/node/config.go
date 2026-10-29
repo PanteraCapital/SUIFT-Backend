@@ -19,6 +19,7 @@ package node
 import (
 	"crypto/ecdsa"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -285,6 +286,21 @@ func DefaultWSEndpoint() string {
 // RPC(http, ws or graphql).
 func (c *Config) ExtRPCEnabled() bool {
 	return c.HTTPHost != "" || c.WSHost != ""
+}
+
+// RemoteRPCEnabled returns whether the HTTP or WebSocket RPC server listens on
+// an interface other than loopback. Host names other than "localhost" are
+// treated as remote because they may resolve to any interface.
+func (c *Config) RemoteRPCEnabled() bool {
+	return !isLoopbackHost(c.HTTPHost) || !isLoopbackHost(c.WSHost)
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // NodeName returns the devp2p node identifier.
