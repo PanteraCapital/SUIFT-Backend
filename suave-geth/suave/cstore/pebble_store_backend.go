@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/common"
@@ -22,6 +23,10 @@ type PebbleStoreBackend struct {
 	cancel context.CancelFunc
 	dbPath string
 	db     *pebble.DB
+
+	// Serializes InitializeBid's existence check and index read-modify-write.
+	// Pebble holds an exclusive lock on dbPath, so no other process writes here.
+	initLock sync.Mutex
 }
 
 var bidByBlockAndProtocolIndexDbKey = func(blockNumber uint64, namespace string) []byte {
@@ -71,6 +76,9 @@ func (b *PebbleStoreBackend) Stop() error {
 func (b *PebbleStoreBackend) InitializeBid(bid suave.Bid) error {
 	key := []byte(formatPebbleBidKey(bid.Id))
 
+	b.initLock.Lock()
+	defer b.initLock.Unlock()
+
 	_, closer, err := b.db.Get(key)
 	if !errors.Is(err, pebble.ErrNotFound) {
 		if err == nil {
@@ -80,11 +88,6 @@ func (b *PebbleStoreBackend) InitializeBid(bid suave.Bid) error {
 	}
 
 	data, err := json.Marshal(bid)
-	if err != nil {
-		return err
-	}
-
-	err = b.db.Set(key, data, nil)
 	if err != nil {
 		return err
 	}
@@ -112,7 +115,15 @@ func (b *PebbleStoreBackend) InitializeBid(bid suave.Bid) error {
 		return err
 	}
 
-	return b.db.Set(dbBlockProtoIndexKey, rawUpdatedValues, nil)
+	batch := b.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(key, data, nil); err != nil {
+		return err
+	}
+	if err := batch.Set(dbBlockProtoIndexKey, rawUpdatedValues, nil); err != nil {
+		return err
+	}
+	return batch.Commit(nil)
 }
 
 func (b *PebbleStoreBackend) FetchBidById(bidId suave.BidId) (suave.Bid, error) {
