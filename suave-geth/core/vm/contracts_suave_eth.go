@@ -9,6 +9,9 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -264,7 +267,117 @@ func (c *buildEthBlock) RunConfidential(suaveContext *SuaveContext, input []byte
 	return artifacts.SuaveAbi.Methods["buildEthBlock"].Outputs.Pack(bidBytes, envelopeBytes)
 }
 
+// builderContractEnv names the operator-configured contract that may have the
+// kettle sign builder bids. It is read on every call; an empty or invalid value
+// authorizes no caller.
+const builderContractEnv = "SUAVE_BUILDER_CONTRACT"
+
+func configuredBuilderContract() (common.Address, error) {
+	raw := strings.TrimSpace(os.Getenv(builderContractEnv))
+	if raw == "" {
+		return common.Address{}, fmt.Errorf("buildEthBlock caller not authorized: %s is not set", builderContractEnv)
+	}
+	if !common.IsHexAddress(raw) {
+		return common.Address{}, fmt.Errorf("buildEthBlock caller not authorized: %s is not a valid address", builderContractEnv)
+	}
+	addr := common.HexToAddress(raw)
+	if addr == (common.Address{}) || addr == buildEthBlockAddress {
+		return common.Address{}, fmt.Errorf("buildEthBlock caller not authorized: %s is not a valid builder contract", builderContractEnv)
+	}
+	return addr, nil
+}
+
+// checkBuildEthBlockCaller requires the contract that directly invoked the
+// precompile to be the configured builder. Callers further up the stack and the
+// transaction origin do not count.
+func checkBuildEthBlockCaller(suaveContext *SuaveContext) error {
+	builder, err := configuredBuilderContract()
+	if err != nil {
+		return err
+	}
+	for i := len(suaveContext.CallerStack) - 1; i >= 0; i-- {
+		caller := suaveContext.CallerStack[i]
+		if caller == nil {
+			break
+		}
+		if *caller == buildEthBlockAddress {
+			continue
+		}
+		if *caller != builder {
+			return fmt.Errorf("buildEthBlock caller not authorized: %s is not the configured builder contract", caller.Hex())
+		}
+		return nil
+	}
+	return errors.New("buildEthBlock caller not authorized: no calling contract")
+}
+
+const maxRetainedBuilderSlots = 1 << 16
+
+// signedBuilderSlots holds, per kettle BLS key, every slot for which a builder
+// bid has been or is being signed. A slot leaves the set only by raising that
+// key's floor past it, and slots below the floor are always refused, so no slot
+// can be signed twice.
+var signedBuilderSlots = &builderSlotLedger{
+	limit: maxRetainedBuilderSlots,
+	keys:  map[phase0.BLSPubKey]*builderKeySlots{},
+}
+
+type builderSlotLedger struct {
+	mu    sync.Mutex
+	limit int
+	keys  map[phase0.BLSPubKey]*builderKeySlots
+}
+
+type builderKeySlots struct {
+	slots map[uint64]struct{}
+	floor uint64
+}
+
+func (l *builderSlotLedger) reserve(key phase0.BLSPubKey, slot uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	entry, ok := l.keys[key]
+	if !ok {
+		entry = &builderKeySlots{slots: map[uint64]struct{}{}}
+		l.keys[key] = entry
+	}
+	if slot < entry.floor {
+		return fmt.Errorf("slot %d is below the oldest retained signed slot %d", slot, entry.floor)
+	}
+	if _, taken := entry.slots[slot]; taken {
+		return fmt.Errorf("a builder bid was already signed for slot %d", slot)
+	}
+	entry.slots[slot] = struct{}{}
+
+	for len(entry.slots) > l.limit {
+		lowest := slot
+		for s := range entry.slots {
+			if s < lowest {
+				lowest = s
+			}
+		}
+		delete(entry.slots, lowest)
+		entry.floor = lowest + 1
+	}
+	return nil
+}
+
+// release must only be called for a reservation whose bid was never signed.
+func (l *builderSlotLedger) release(key phase0.BLSPubKey, slot uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if entry, ok := l.keys[key]; ok {
+		delete(entry.slots, slot)
+	}
+}
+
 func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.BuildBlockArgs, bidId types.BidId, namespace string) ([]byte, []byte, error) {
+	if err := checkBuildEthBlockCaller(suaveContext); err != nil {
+		return nil, nil, err
+	}
+
 	bidIds := [][16]byte{}
 	// first check for merged bid, else assume regular bid
 	if mergedBidsBytes, err := suaveContext.Backend.ConfidentialStore.Retrieve(bidId, buildEthBlockAddress, "default:v0:mergedBids"); err == nil {
@@ -362,8 +475,38 @@ func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.Buil
 		}
 	}
 
+	blsPk, err := bls.PublicKeyFromSecretKey(suaveContext.Backend.EthBlockSigningKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not get bls pubkey: %w", err)
+	}
+
+	pk, err := boostUtils.BlsPublicKeyToPublicKey(blsPk)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not format bls pubkey as bytes: %w", err)
+	}
+
+	// The signed bid uses these values, not blockArgs, so the backend cannot
+	// change which slot is signed after it has been reserved.
+	slot := blockArgs.Slot
+	feeRecipient := blockArgs.FeeRecipient
+	var proposerPubkey [48]byte
+	copy(proposerPubkey[:], blockArgs.ProposerPubkey)
+
+	if err := signedBuilderSlots.reserve(pk, slot); err != nil {
+		return nil, nil, err
+	}
+	signed := false
+	defer func() {
+		if !signed {
+			signedBuilderSlots.release(pk, slot)
+		}
+	}()
+
+	buildArgs := blockArgs
+	buildArgs.ProposerPubkey = append([]byte(nil), blockArgs.ProposerPubkey...)
+
 	log.Info("requesting a block be built", "mergedBundles", mergedBundles)
-	envelope, err := suaveContext.Backend.ConfidentialEthBackend.BuildEthBlockFromBundles(context.TODO(), &blockArgs, mergedBundles)
+	envelope, err := suaveContext.Backend.ConfidentialEthBackend.BuildEthBlockFromBundles(context.TODO(), &buildArgs, mergedBundles)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not build eth block: %w", err)
 	}
@@ -375,30 +518,18 @@ func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.Buil
 		return nil, nil, fmt.Errorf("could not format execution payload as capella payload: %w", err)
 	}
 
-	blsPk, err := bls.PublicKeyFromSecretKey(suaveContext.Backend.EthBlockSigningKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("could not get bls pubkey: %w", err)
-	}
-
-	pk, err := boostUtils.BlsPublicKeyToPublicKey(blsPk)
-	if err != nil {
-		return nil, nil, fmt.Errorf("could not format bls pubkey as bytes: %w", err)
-	}
-
 	value, overflow := uint256.FromBig(envelope.BlockValue)
 	if overflow {
 		return nil, nil, fmt.Errorf("block value %v overflows", *envelope.BlockValue)
 	}
-	var proposerPubkey [48]byte
-	copy(proposerPubkey[:], blockArgs.ProposerPubkey)
 
 	blockBidMsg := builderV1.BidTrace{
-		Slot:                 blockArgs.Slot,
+		Slot:                 slot,
 		ParentHash:           payload.ParentHash,
 		BlockHash:            payload.BlockHash,
 		BuilderPubkey:        pk,
 		ProposerPubkey:       phase0.BLSPubKey(proposerPubkey),
-		ProposerFeeRecipient: bellatrix.ExecutionAddress(blockArgs.FeeRecipient),
+		ProposerFeeRecipient: bellatrix.ExecutionAddress(feeRecipient),
 		GasLimit:             envelope.ExecutionPayload.GasLimit,
 		GasUsed:              envelope.ExecutionPayload.GasUsed,
 		Value:                value,
@@ -407,6 +538,7 @@ func (c *buildEthBlock) runImpl(suaveContext *SuaveContext, blockArgs types.Buil
 	// hardcoded for goerli, should be passed in with the inputs
 	genesisForkVersion := phase0.Version{0x00, 0x00, 0x10, 0x20}
 	builderSigningDomain := ssz.ComputeDomain(ssz.DomainTypeAppBuilder, genesisForkVersion, phase0.Root{})
+	signed = true
 	signature, err := ssz.SignMessage(&blockBidMsg, builderSigningDomain, suaveContext.Backend.EthBlockSigningKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not sign builder bid: %w", err)
