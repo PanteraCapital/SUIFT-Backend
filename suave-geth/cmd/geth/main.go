@@ -20,7 +20,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -489,32 +488,8 @@ func prepareSuaveDev(ctx *cli.Context) error {
 		return nil
 	}
 
-	suaveDataTmpPath := "/tmp/suave-dev"
-	keystorePath := suaveDataTmpPath + "/keystore"
-	passwordPath := suaveDataTmpPath + "/password.txt"
-
-	// create a data directory under /tmp/suave-dev (if it does not exists) to store
-	// the keystore and the password (empty file) to unlock the execution node account.
-	if _, err := os.Stat(suaveDataTmpPath); err != nil {
-		if err := os.MkdirAll(suaveDataTmpPath, 0755); err != nil {
-			return err
-		}
-
-		// create the keystore
-		if err := os.MkdirAll(keystorePath, 0755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(keystorePath, "key.json"), []byte(suaveKeystore), 0755); err != nil {
-			return err
-		}
-
-		// create the password
-		if err := os.WriteFile(passwordPath, []byte(""), 0755); err != nil {
-			return err
-		}
-	}
-
-	// set the flags
+	// The developer account created by --dev is used as the execution node
+	// account. HTTP and WebSocket keep their loopback listen addresses.
 	flags := map[string]string{
 		utils.DeveloperFlag.Name:         "true",
 		utils.DeveloperGasLimitFlag.Name: "30000000",
@@ -524,10 +499,6 @@ func prepareSuaveDev(ctx *cli.Context) error {
 		utils.HTTPCORSDomainFlag.Name:    "*",
 		utils.WSEnabledFlag.Name:         "true",
 		utils.WSAllowedOriginsFlag.Name:  "*",
-		utils.WSListenAddrFlag.Name:      "0.0.0.0",
-		utils.KeyStoreDirFlag.Name:       keystorePath,
-		utils.UnlockedAccountFlag.Name:   "0xB5fEAfbDD752ad52Afb7e1bD2E40432A485bBB7F",
-		utils.PasswordFileFlag.Name:      passwordPath,
 	}
 
 	for k, v := range flags {
@@ -538,5 +509,3 @@ func prepareSuaveDev(ctx *cli.Context) error {
 
 	return nil
 }
-
-var suaveKeystore = `{"address":"b5feafbdd752ad52afb7e1bd2e40432a485bbb7f","crypto":{"cipher":"aes-128-ctr","ciphertext":"8075ff2ed17c6cf6cd162b4bdd2926034e2067f03055990d57510e5d807ef06e","cipherparams":{"iv":"8c31b77d9518a68fda4aa6c90d62562d"},"kdf":"scrypt","kdfparams":{"dklen":32,"n":262144,"p":1,"r":8,"salt":"6e55b1eea32430c4dc0b87cfc31168d552249b8ba946314e3c41dbeaeed3d125"},"mac":"5e411244fd732deb4464d247cfeb9beadc8a37558f12720c4d2ee8691436c50c"},"id":"51d12702-2276-44a9-972e-2011c56edf4e","version":3}`

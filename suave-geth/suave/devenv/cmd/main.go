@@ -19,7 +19,6 @@ import (
 )
 
 var (
-	exNodeEthAddr = common.HexToAddress("b5feafbdd752ad52afb7e1bd2e40432a485bbb7f")
 	exNodeNetAddr = "http://localhost:8545"
 
 	// This account is funded in both devnev networks
@@ -34,6 +33,16 @@ var (
 
 func main() {
 	rpc, _ := rpc.Dial(exNodeNetAddr)
+
+	// The execution node generates its key at startup.
+	var exNodeEthAddrs []common.Address
+	if err := rpc.Call(&exNodeEthAddrs, "eth_executionAddress"); err != nil || len(exNodeEthAddrs) == 0 {
+		fmt.Printf("Error: failed to get the execution node address: %v\n", err)
+		os.Exit(1)
+	}
+	exNodeEthAddr := exNodeEthAddrs[0]
+	fmt.Printf("Execution node address: %s\n", exNodeEthAddr.Hex())
+
 	mevmClt := sdk.NewClient(rpc, fundedAccount.priv, exNodeEthAddr)
 
 	var mevShareContract *sdk.Contract
